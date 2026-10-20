@@ -1,0 +1,9 @@
+name = "lucas-5m-ai"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# Set secrets via Cloudflare dashboard: OPENAI_API_KEY, ACCESS_TOKEN
+# Create a Workers KV namespace, then replace placeholder ID below.
+[[kv_namespaces]]
+binding = "RATE_KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
