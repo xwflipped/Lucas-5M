@@ -1,0 +1,27 @@
+// Lucas-5M personal AI analysis worker. No order placement. Cloudflare Workers module syntax.
+const ORIGIN="https://xwflipped.github.io";
+const STEP=300000;
+const json=(body,status=200,origin=ORIGIN)=>new Response(JSON.stringify(body),{status,headers:{"content-type":"application/json; charset=utf-8","access-control-allow-origin":origin,"vary":"Origin","cache-control":"no-store","x-content-type-options":"nosniff"}});
+function round(t){return Math.floor(t/STEP)*STEP}
+function safeEq(a,b){if(typeof a!=="string"||typeof b!=="string")return false;let diff=a.length^b.length;for(let i=0;i<Math.max(a.length,b.length);i++)diff|=(a.charCodeAt(i)||0)^(b.charCodeAt(i)||0);return diff===0}
+export default {async fetch(req,env){const origin=req.headers.get("origin");if(req.method==="OPTIONS"){if(origin!==ORIGIN)return new Response(null,{status:403});return new Response(null,{status:204,headers:{"access-control-allow-origin":ORIGIN,"access-control-allow-methods":"POST, OPTIONS","access-control-allow-headers":"authorization, content-type","access-control-max-age":"600"}})}
+if(req.method!=="POST"||new URL(req.url).pathname!=="/analyze")return json({error:"Not found"},404);
+if(origin!==ORIGIN)return json({error:"Origin not allowed"},403);
+if(!env.OPENAI_API_KEY||!env.ACCESS_TOKEN)return json({error:"Worker secrets not configured"},503);
+if(!safeEq(req.headers.get("authorization")?.replace(/^Bearer /,""),env.ACCESS_TOKEN))return json({error:"Access denied"},401);
+const len=+(req.headers.get("content-length")||0);if(len>1024)return json({error:"Request too large"},413);
+let body;try{body=await req.json()}catch{return json({error:"Invalid JSON"},400)}
+if(!body||!Number.isFinite(body.targetStart)||!Number.isFinite(body.upPrice)||!Number.isFinite(body.downPrice))return json({error:"Invalid input"},400);
+const now=Date.now(),target=body.targetStart;
+if(target%STEP!==0||target<round(now)||target>round(now)+6*STEP)return json({error:"Target time invalid"},400);
+if(!(body.upPrice>0&&body.upPrice<1&&body.downPrice>0&&body.downPrice<1))return json({error:"Price must be between 0 and 1"},400);
+// Per-user token plus minute time window. Requires KV binding RATE_KV for actual enforcement.
+if(!env.RATE_KV)return json({error:"RATE_KV binding missing; deployment intentionally blocked"},503);
+const key="ratelimit:"+round(now/60000*STEP)/STEP; // unique minute key, shared personal token
+const previous=+(await env.RATE_KV.get(key)||0);if(previous>=2)return json({error:"Too many requests this minute"},429);await env.RATE_KV.put(key,String(previous+1),{expirationTtl:120});
+let candles;try{const u="https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=100";const r=await fetch(u,{signal:AbortSignal.timeout(8000)});if(!r.ok)throw Error("Binance HTTP "+r.status);const data=await r.json();candles=data.filter(x=>+x[6]<now).slice(-72).map(x=>({time:+x[0],open:+x[1],high:+x[2],low:+x[3],close:+x[4],volume:+x[5]}));if(candles.length<48)throw Error("insufficient candles");for(let i=1;i<candles.length;i++)if(candles[i].time-candles[i-1].time!==STEP)throw Error("candle gap")}catch(e){return json({recommendation:"WAIT",reason:"行情不可用："+String(e.message).slice(0,100),validUntil:target},200)}
+const last=candles.at(-1).time;const targetClose=target+STEP;
+const prompt={market:"BTCUSDT Binance spot 5m proxy (not settlement index)",targetStartUTC:new Date(target).toISOString(),targetEndUTC:new Date(targetClose).toISOString(),upSharePrice:body.upPrice,downSharePrice:body.downPrice,candles,notes:"The actual prediction-market settlement rule and executable quotes are unverified. Prices were manually supplied by user. Do not claim calibrated probabilities."};
+const schema={type:"object",additionalProperties:false,required:["recommendation","reason","counterargument","risk","evidence"],properties:{recommendation:{type:"string",enum:["UP","DOWN","WAIT"]},reason:{type:"string"},counterargument:{type:"string"},risk:{type:"string",enum:["HIGH","VERY_HIGH"]},evidence:{type:"array",items:{type:"string"},maxItems:4}}};
+try{const r=await fetch("https://api.openai.com/v1/chat/completions",{method:"POST",headers:{"authorization":"Bearer "+env.OPENAI_API_KEY,"content-type":"application/json"},body:JSON.stringify({model:env.OPENAI_MODEL||"gpt-4.1-mini",temperature:0.2,max_tokens:450,response_format:{type:"json_schema",json_schema:{name:"lucas_signal",strict:true,schema}},messages:[{role:"system",content:"You are a cautious BTC five-minute prediction-market research assistant. Answer in concise Simplified Chinese. The evidence does not establish a tradable edge; default to WAIT unless strong independent evidence supports direction AND price edge. Never invent probability, live prediction-market quotes, order execution, settlement rules or certainty. No trade execution. Explicitly acknowledge limitations and counterarguments."},{role:"user",content:JSON.stringify(prompt)}]}) ,signal:AbortSignal.timeout(18000)});if(!r.ok)throw Error("OpenAI HTTP "+r.status);const data=await r.json();const out=JSON.parse(data.choices[0].message.content);if(!["UP","DOWN","WAIT"].includes(out.recommendation))throw Error("invalid recommendation");return json({...out,targetStart:target,targetEnd:targetClose,generatedAt:Date.now(),spotLastClosedAt:last,source:"Binance spot 5m + OpenAI",simulationOnly:true})}catch(e){return json({recommendation:"WAIT",reason:"GPT 分析失败："+String(e.message).slice(0,100),validUntil:target},200)}
+}};
